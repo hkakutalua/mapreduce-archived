@@ -27,10 +27,16 @@ const (
 	ReduceTask = 2
 )
 
+type IntermediateFile struct {
+	Path      string
+	Partition int
+}
+
 type Task struct {
-	Id     int
-	Type   TaskType
-	Status TaskStatus
+	Id                int
+	Type              TaskType
+	Status            TaskStatus
+	IntermediateFiles []IntermediateFile
 }
 
 type Status int
@@ -45,16 +51,118 @@ type Worker struct {
 	Status  Status
 }
 
-type MasterState struct {
-	m                      int
-	r                      int
-	inputFileName          string
-	mapTasks               []Task
-	reduceTasks            []Task
-	workers                []Worker
-	mapTasksAssignments    map[string]int // WorkerAddress -> TaskId
-	reduceTasksAssignments map[string]int // WorkerAddress -> TaskId
+type State struct {
+	M                      int
+	R                      int
+	InputFileName          string
+	MapTasks               []Task
+	ReduceTasks            []Task
+	Workers                []Worker
+	MapTasksAssignments    map[string]int                // WorkerAddress -> TaskId
+	ReduceTasksAssignments map[string]int                // WorkerAddress -> TaskId
+	IntermediateFiles      map[string][]IntermediateFile // WorkerAddress -> []IntermediateFile
 	mutex                  sync.Mutex
+}
+
+func (state *State) updateWorkerStatus(workerAddress string, newStatus Status) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	for i, worker := range state.Workers {
+		if worker.Address == workerAddress {
+			state.Workers[i].Status = newStatus
+		}
+	}
+}
+
+func (state *State) assignMapTaskToWorker(taskId int, workerAddress string) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	for i, mapTask := range state.MapTasks {
+		if mapTask.Id == taskId {
+			state.MapTasksAssignments[workerAddress] = taskId
+			mapTask.Status = InProgress
+			state.MapTasks[i] = mapTask
+			break
+		}
+	}
+}
+
+func (state *State) assignReduceTaskToWorker(taskId int, workerAddress string) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	for i, reduceTask := range state.ReduceTasks {
+		if reduceTask.Id == taskId {
+			state.ReduceTasksAssignments[workerAddress] = taskId
+			reduceTask.Status = InProgress
+			state.ReduceTasks[i] = reduceTask
+			break
+		}
+	}
+}
+
+func (state *State) resetTaskOnWorker(workerAdress string) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	mapTaskId, hasMapTask := state.MapTasksAssignments[workerAdress]
+	if hasMapTask {
+		delete(state.MapTasksAssignments, workerAdress)
+		mapTask := state.MapTasks[mapTaskId]
+		mapTask.Status = Idle
+		state.IntermediateFiles[workerAdress] = nil
+		state.MapTasks[mapTaskId] = mapTask
+	}
+
+	reduceTaskId, hasReduceTask := state.ReduceTasksAssignments[workerAdress]
+	if hasReduceTask {
+		delete(state.ReduceTasksAssignments, workerAdress)
+		reduceTask := state.ReduceTasks[reduceTaskId]
+		if reduceTask.Status != Completed {
+			reduceTask.Status = Idle
+			state.MapTasks[reduceTaskId] = reduceTask
+		}
+	}
+}
+
+func (state *State) completeMapTask(
+	taskId int,
+	workerAddress string,
+	intermediateFiles []IntermediateFile,
+) {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	mapTask := state.MapTasks[taskId]
+	mapTask.Status = Completed
+	state.MapTasks[taskId] = mapTask
+
+	newIntermediateFiles := append(state.IntermediateFiles[workerAddress], intermediateFiles...)
+	state.IntermediateFiles[workerAddress] = newIntermediateFiles
+}
+
+type MasterServer struct {
+	state *State
+}
+
+type MapTaskCompletionRequest struct {
+	TaskId            int
+	WorkerAddress     string
+	IntermediateFiles []IntermediateFile
+}
+type MapTaskCompletionResponse struct {
+	Error string
+}
+
+func (masterServer *MasterServer) NotifyMapTaskCompletion(
+	args MapTaskCompletionRequest,
+	reply *MapTaskCompletionResponse,
+) error {
+	state := masterServer.state
+	state.completeMapTask(args.TaskId, args.WorkerAddress, args.IntermediateFiles)
+	return nil
 }
 
 type HeartbeatRequest struct{}
@@ -63,54 +171,16 @@ type HeartbeatReply struct{}
 type MapTaskStartRequest struct {
 	InputSplitFileName string
 }
-
 type MapTaskStartReply struct{}
 
-func (masterState *MasterState) updateWorkerStatus(workerAddress string, newStatus Status) {
-	masterState.mutex.Lock()
-	defer masterState.mutex.Unlock()
-
-	for i, worker := range masterState.workers {
-		if worker.Address == workerAddress {
-			masterState.workers[i].Status = newStatus
-		}
-	}
+type ReduceIntermediateFile struct {
+	Path          string
+	WorkerAddress string
 }
-
-func (masterState *MasterState) assignMapTaskToWorker(taskId int, workerAddress string) {
-	masterState.mutex.Lock()
-	defer masterState.mutex.Unlock()
-
-	for _, mapTask := range masterState.mapTasks {
-		if mapTask.Id == taskId {
-			masterState.mapTasksAssignments[workerAddress] = taskId
-			break
-		}
-	}
+type ReduceTaskStartRequest struct {
+	IntermediateFiles []ReduceIntermediateFile
 }
-
-func (masterState *MasterState) resetTaskOnWorker(workerAdress string) {
-	masterState.mutex.Lock()
-	defer masterState.mutex.Unlock()
-
-	mapTaskId, hasMapTask := masterState.mapTasksAssignments[workerAdress]
-	if hasMapTask {
-		delete(masterState.mapTasksAssignments, workerAdress)
-		mapTask := masterState.mapTasks[mapTaskId]
-		mapTask.Status = Idle
-		masterState.mapTasks[mapTaskId] = mapTask
-	}
-
-	reduceTaskId, hasReduceTask := masterState.reduceTasksAssignments[workerAdress]
-	if hasReduceTask {
-		delete(masterState.reduceTasksAssignments, workerAdress)
-		reduceTask := masterState.reduceTasks[reduceTaskId]
-		if reduceTask.Status != Completed {
-			reduceTask.Status = Idle
-			masterState.mapTasks[reduceTaskId] = reduceTask
-		}
-	}
-}
+type ReduceTaskStartReply struct{}
 
 func main() {
 	if len(os.Args) < 5 {
@@ -155,40 +225,43 @@ func main() {
 		workers[i] = Worker{Address: workerAddresses[i], Status: WorkerDown}
 	}
 
-	masterState := MasterState{
-		m:                      m,
-		r:                      r,
-		inputFileName:          inputFileName,
-		mapTasks:               mapTasks,
-		reduceTasks:            reduceTasks,
-		workers:                workers,
-		mapTasksAssignments:    map[string]int{},
-		reduceTasksAssignments: map[string]int{},
+	state := State{
+		M:                      m,
+		R:                      r,
+		InputFileName:          inputFileName,
+		MapTasks:               mapTasks,
+		ReduceTasks:            reduceTasks,
+		Workers:                workers,
+		MapTasksAssignments:    map[string]int{},
+		ReduceTasksAssignments: map[string]int{},
 	}
 
-	go watchWorkersStatus(&masterState)
-	go runMapTasks(&masterState)
+	go watchWorkersStatus(&state)
+	go runMapTasks(&state)
+	go runReduceTasks(&state)
+	go startMasterServer("localhost:6432", &MasterServer{&state})
 
 	for {
 		time.Sleep(5 * time.Second)
 	}
 }
 
-func watchWorkersStatus(masterState *MasterState) {
+func watchWorkersStatus(state *State) {
 	for {
-		for _, worker := range masterState.workers {
+		for _, worker := range state.Workers {
 			status := fetchWorkerStatus(worker)
+
 			if status != WorkerUp {
 				_, workerHasMapTaskAssigned :=
-					masterState.mapTasksAssignments[worker.Address]
+					state.MapTasksAssignments[worker.Address]
 				_, workerHasReduceTaskAssigned :=
-					masterState.reduceTasksAssignments[worker.Address]
+					state.ReduceTasksAssignments[worker.Address]
 				if workerHasMapTaskAssigned || workerHasReduceTaskAssigned {
-					masterState.resetTaskOnWorker(worker.Address)
+					state.resetTaskOnWorker(worker.Address)
 				}
 			}
 
-			masterState.updateWorkerStatus(worker.Address, status)
+			state.updateWorkerStatus(worker.Address, status)
 		}
 
 		time.Sleep(5 * time.Second)
@@ -218,27 +291,27 @@ func fetchWorkerStatus(worker Worker) Status {
 	return WorkerUp
 }
 
-func runMapTasks(masterState *MasterState) {
+func runMapTasks(state *State) {
 	for {
-		for _, mapTask := range masterState.mapTasks {
+		for _, mapTask := range state.MapTasks {
 			if mapTask.Status != Idle {
 				continue
 			}
 
-			for _, worker := range masterState.workers {
+			for _, worker := range state.Workers {
 				if worker.Status != WorkerUp {
 					continue
 				}
 
-				_, workerHasTaskAssigned := masterState.mapTasksAssignments[worker.Address]
+				_, workerHasTaskAssigned := state.MapTasksAssignments[worker.Address]
 				if workerHasTaskAssigned {
 					continue
 				}
 
-				inputSplitFileName := masterState.inputFileName + "_" + strconv.Itoa(mapTask.Id)
+				inputSplitFileName := state.InputFileName + "_" + strconv.Itoa(mapTask.Id)
 				err := runMapTaskOnWorker(worker, mapTask, inputSplitFileName)
 				if err == nil {
-					masterState.assignMapTaskToWorker(mapTask.Id, worker.Address)
+					state.assignMapTaskToWorker(mapTask.Id, worker.Address)
 				}
 			}
 		}
@@ -275,6 +348,111 @@ func runMapTaskOnWorker(
 	}
 
 	return nil
+}
+
+func runReduceTasks(state *State) {
+	for {
+		allMapTasksAreCompleted := true
+		for _, mapTask := range state.MapTasks {
+			if mapTask.Status != Completed {
+				allMapTasksAreCompleted = false
+				break
+			}
+		}
+
+		if !allMapTasksAreCompleted {
+			continue
+		}
+
+		for reduceTaskPartition, reduceTask := range state.ReduceTasks {
+			if reduceTask.Status != Idle {
+				continue
+			}
+
+			for _, worker := range state.Workers {
+				_, isWorkerWithTaskAssigned := state.ReduceTasksAssignments[worker.Address]
+				if worker.Status != WorkerUp || isWorkerWithTaskAssigned {
+					continue
+				}
+
+				intermediateFiles := make([]IntermediateFile, 0)
+				for key := range state.IntermediateFiles {
+					for _, intermediateFile := range state.IntermediateFiles[key] {
+						if intermediateFile.Partition == reduceTaskPartition {
+							intermediateFiles =
+								append(intermediateFiles, intermediateFile)
+						}
+					}
+				}
+
+				err := runReduceTaskOnWorker(worker, reduceTask, intermediateFiles)
+				if err != nil {
+					state.assignReduceTaskToWorker(reduceTask.Id, worker.Address)
+				}
+			}
+		}
+	}
+}
+
+func runReduceTaskOnWorker(
+	worker Worker,
+	reduceTask Task,
+	intermediateFiles []IntermediateFile,
+) error {
+	if reduceTask.Type != MapTask {
+		return errors.New("task type must be 'ReduceTask'")
+	}
+
+	conn, client, err := connectTo(worker.Address)
+	if err != nil {
+		return err
+	}
+	defer (*conn).Close()
+	defer client.Close()
+
+	log.Printf("Sending task %v to '%v'...\n", reduceTask.Id, worker.Address)
+
+	reduceIntermediateFiles := make([]ReduceIntermediateFile, len(intermediateFiles))
+	for i, intermediateFile := range intermediateFiles {
+		reduceIntermediateFiles[i] = ReduceIntermediateFile{
+			Path:          intermediateFile.Path,
+			WorkerAddress: worker.Address,
+		}
+	}
+
+	reduceTaskStartRequest := ReduceTaskStartRequest{reduceIntermediateFiles}
+	reduceTaskStartReply := ReduceTaskStartReply{}
+	err = client.Call("WorkerTask.ReduceTaskStart", reduceTaskStartRequest, &reduceTaskStartReply)
+	if err != nil {
+		log.Printf("Could not receive WorkerTask.MapTaskStart reply from worker: '%v'\n", err)
+		return err
+	}
+
+	return nil
+}
+
+func startMasterServer(serverAddress string, masterServer *MasterServer) {
+	rpcServer := rpc.NewServer()
+	err := rpcServer.Register(masterServer)
+	if err != nil {
+		log.Fatalf("Could not register master's RPC methods.\nReason: '%v'", err)
+	}
+
+	listener, err := net.Listen("tcp", serverAddress)
+	if err != nil {
+		log.Fatalf("Could not start master's server on address '%v'.\nReason: '%v'", serverAddress, err)
+		os.Exit(-1)
+	}
+
+	for {
+		connection, err := listener.Accept()
+		if err != nil {
+			log.Printf("Could not accept connection from worker.\nReason: '%v'", err)
+			continue
+		}
+
+		go rpc.ServeConn(connection)
+	}
 }
 
 func connectTo(address string) (*net.Conn, *rpc.Client, error) {
