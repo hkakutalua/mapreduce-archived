@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"log"
@@ -6,30 +6,17 @@ import (
 	"net/rpc"
 	"os"
 	"strconv"
+
+	"github.com/henrick/mapreduce/pkg/data"
 )
 
-type WorkerHeartbeat bool
-type HeartbeatRequest struct{}
-type HeartbeatReply struct{}
+const GetHeartbeat = "Server.GetHeartbeat"
+const StartMapTask = "Server.StartMapTask"
+const StartReduceTask = "Server.StartReduceTask"
 
-func (w *WorkerHeartbeat) GetHeartbeat(args *HeartbeatRequest, reply *HeartbeatReply) error {
-	*reply = HeartbeatReply{}
-	return nil
-}
+type Server struct{}
 
-type WorkerTask struct{}
-type MapTaskStartRequest struct {
-	InputSplitFileName string
-	M                  int
-}
-type MapTaskStartReply struct{}
-
-func (w *WorkerTask) MapTaskStart(args *MapTaskStartRequest, reply *MapTaskStartReply) error {
-	*reply = MapTaskStartReply{}
-	return nil
-}
-
-func main() {
+func Run() {
 	port := 12345
 	log.Printf("Listening to connections on port %v\n", port)
 
@@ -40,15 +27,8 @@ func main() {
 	}
 	defer listener.Close()
 
-	workerHeartbeat := new(WorkerHeartbeat)
-	err = rpc.Register(workerHeartbeat)
-	if err != nil {
-		log.Fatalf("Could not register RPC functions: %v", err)
-		os.Exit(-1)
-	}
-
-	workerTask := new(WorkerTask)
-	err = rpc.Register(workerTask)
+	server := new(Server)
+	err = rpc.Register(server)
 	if err != nil {
 		log.Fatalf("Could not register RPC functions: %v", err)
 		os.Exit(-1)
@@ -68,4 +48,14 @@ func main() {
 			log.Printf("Closing connection from host %v\n", conn.RemoteAddr())
 		}(conn)
 	}
+}
+
+func (server *Server) GetHeartbeat(args *data.HeartbeatArgs, reply *data.HeartbeatReply) error {
+	*reply = data.HeartbeatReply{}
+	return nil
+}
+
+func (server *Server) StartMapTask(args *data.StartMapTaskArgs, reply *data.StartMapTaskReply) error {
+	*reply = data.StartMapTaskReply{}
+	return nil
 }
